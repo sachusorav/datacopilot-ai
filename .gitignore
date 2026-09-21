@@ -1,0 +1,39 @@
+# Environment variables - NEVER commit these
+backend/.env
+frontend/.env
+
+# Python virtualenv
+backend/venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Database files
+*.db
+*.sqlite3
+
+# Uploaded & processed data files (runtime only)
+backend/uploads/
+backend/processed/
+backend/reports/
+
+# Sample data CSVs (optional — remove this line if you want them in repo)
+# sample_data/*.csv
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

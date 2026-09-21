@@ -1,0 +1,28 @@
+services:
+  # Backend FastAPI Service
+  - type: web
+    name: datacopilot-backend
+    env: python
+    region: oregon
+    buildCommand: "pip install -r backend/requirements.txt"
+    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite:///./datacopilot.db
+
+  # Frontend React Service
+  - type: web
+    name: datacopilot-frontend
+    env: static
+    buildCommand: "cd frontend && npm install && npm run build fontend"
+    staticPublishPath: "./frontend/dist"
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: datacopilot-backend
+          property: url
