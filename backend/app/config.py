@@ -6,7 +6,20 @@ load_dotenv()
 
 class Settings(BaseSettings):
     APP_NAME: str = "DataCopilot AI"
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    
+    # LLM Settings
+    LLM_PROVIDER_ORDER: str = os.getenv("LLM_PROVIDER_ORDER", "ollama,groq")
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "20.0"))
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+
+    # Security & Storage
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "datacopilot-jwt-secret-key-change-in-production")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./datacopilot.db")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "./uploads")
     PROCESSED_DIR: str = os.getenv("PROCESSED_DIR", "./processed")

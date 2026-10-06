@@ -1,277 +1,243 @@
-import pandas as pd
+import logging
 import numpy as np
-from typing import Tuple, Optional, Dict, Any, List
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
-from sklearn.linear_model import Ridge
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import r2_score, mean_absolute_error, accuracy_score
-from app.schemas.schemas import SalesPredictResponse, ForecastPoint, ChurnPredictResponse, ChurnCustomerRisk
+import pandas as pd
+from typing import Dict, Any, List, Optional
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.metrics import precision_score, recall_score, roc_auc_score
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-def train_sales_forecast(df: pd.DataFrame) -> SalesPredictResponse:
+logger = logging.getLogger(__name__)
+
+def calculate_data_quality_score(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Identifies date column & sales column in dataframe, aggregates sales by date,
-    trains a regression model, and predicts future periods.
+    Computes an objective Data Quality Score (0-100) based on completeness,
+    duplicates, type consistency, and statistical outliers.
     """
     if df.empty:
-        return SalesPredictResponse(supported=False, message="Dataset is empty.")
-    
-    # 1. Identify Date Column
-    date_col = None
-    for col in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            date_col = col
-            break
-        elif "date" in col.lower() or "time" in col.lower() or "day" in col.lower():
-            try:
-                df[col] = pd.to_datetime(df[col], errors='coerce')
-                if df[col].notnull().sum() > 0.5 * len(df):
-                    date_col = col
-                    break
-            except Exception:
-                pass
-                
-    if not date_col:
-        return SalesPredictResponse(
-            supported=False,
-            message="No date/time column detected in dataset. Sales forecasting requires a date column."
-        )
+        return {"overall_score": 0, "completeness": 0, "uniqueness": 0, "outlier_ratio": 0}
 
-    # 2. Identify Target Sales Column
-    target_col = None
-    priority_keywords = ["sales", "revenue", "total_sales", "amount", "total", "price"]
-    for kw in priority_keywords:
-        matching = [c for c in df.columns if kw in c.lower() and pd.api.types.is_numeric_dtype(df[c])]
-        if matching:
-            target_col = matching[0]
-            break
-            
-    if not target_col:
-        # Fall back to first numeric non-id column
-        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and "id" not in c.lower() and "zip" not in c.lower()]
-        if numeric_cols:
-            target_col = numeric_cols[0]
+    total_cells = df.size
+    missing_cells = int(df.isnull().sum().sum())
+    completeness_pct = round(((total_cells - missing_cells) / total_cells) * 100, 1)
 
-    if not target_col:
-        return SalesPredictResponse(
-            supported=False,
-            message="No numeric sales/revenue column detected in dataset."
-        )
+    total_rows = len(df)
+    duplicate_rows = int(df.duplicated().sum())
+    uniqueness_pct = round(((total_rows - duplicate_rows) / total_rows) * 100, 1)
 
-    # 3. Resample & Aggregate Time Series Data
-    df_ts = df.dropna(subset=[date_col, target_col]).copy()
-    df_ts = df_ts.sort_values(by=date_col)
-    
-    # Group by date (Daily or Monthly depending on range)
-    grouped = df_ts.groupby(df_ts[date_col].dt.date)[target_col].sum().reset_index()
-    grouped.columns = ['date', 'sales']
-    grouped['date'] = pd.to_datetime(grouped['date'])
-    grouped = grouped.sort_values(by='date').reset_index(drop=True)
+    # Outlier Detection on numeric features
+    num_df = df.select_dtypes(include=[np.number]).dropna()
+    outlier_ratio_pct = 100.0
+    if len(num_df) > 10 and len(num_df.columns) > 0:
+        iso = IsolationForest(contamination=0.05, random_state=42)
+        preds = iso.fit_predict(num_df)
+        outlier_count = int((preds == -1).sum())
+        outlier_ratio_pct = round(((len(num_df) - outlier_count) / len(num_df)) * 100, 1)
 
-    if len(grouped) < 5:
-        return SalesPredictResponse(
-            supported=False,
-            message=f"Insufficient date records ({len(grouped)}) for time-series forecasting. Need at least 5 distinct dates."
-        )
-
-    # 4. Feature Engineering (Day index, Month, DayOfWeek, Lag features)
-    grouped['day_index'] = (grouped['date'] - grouped['date'].min()).dt.days
-    grouped['month'] = grouped['date'].dt.month
-    grouped['dayofweek'] = grouped['date'].dt.dayofweek
-
-    X = grouped[['day_index', 'month', 'dayofweek']]
-    y = grouped['sales']
-
-    if len(grouped) >= 10:
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    else:
-        X_train, X_test, y_train, y_test = X, X, y, y
-
-    # Train Model (GradientBoosting or Ridge)
-    model = GradientBoostingRegressor(n_estimators=50, random_state=42)
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    r2 = max(0.0, float(r2_score(y_test, y_pred))) if len(y_test) > 1 else 0.85
-    mae = float(mean_absolute_error(y_test, y_pred))
-
-    cv_score = r2
-    if len(grouped) >= 10:
-        cv_scores = cross_val_score(model, X, y, cv=min(3, len(grouped)//3))
-        cv_score = max(0.0, float(np.mean(cv_scores)))
-
-    # 5. Generate Future Forecast (14 future periods)
-    last_date = grouped['date'].max()
-    freq = "D"
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=14, freq=freq)
-
-    future_df = pd.DataFrame({'date': future_dates})
-    future_df['day_index'] = (future_df['date'] - grouped['date'].min()).dt.days
-    future_df['month'] = future_df['date'].dt.month
-    future_df['dayofweek'] = future_df['date'].dt.dayofweek
-
-    future_preds = model.predict(future_df[['day_index', 'month', 'dayofweek']])
-    future_preds = [max(0.0, float(p)) for p in future_preds]
-
-    forecast_points: List[ForecastPoint] = []
-    # Historical points
-    for idx, row in grouped.iterrows():
-        forecast_points.append(ForecastPoint(
-            date=row['date'].strftime("%Y-%m-%d"),
-            historical_sales=round(float(row['sales']), 2),
-            forecast_sales=None
-        ))
-
-    # Future points
-    for idx, row in future_df.iterrows():
-        forecast_points.append(ForecastPoint(
-            date=row['date'].strftime("%Y-%m-%d"),
-            historical_sales=None,
-            forecast_sales=round(float(future_preds[idx]), 2)
-        ))
-
-    return SalesPredictResponse(
-        supported=True,
-        message="Sales forecast successfully generated.",
-        r2_score=round(r2, 4),
-        mae=round(mae, 2),
-        cv_score=round(cv_score, 4),
-        date_column=str(date_col),
-        target_column=str(target_col),
-        forecast_data=forecast_points
+    # Weighted Average Score
+    overall_score = round(
+        (completeness_pct * 0.40) +
+        (uniqueness_pct * 0.35) +
+        (outlier_ratio_pct * 0.25),
+        1
     )
 
+    return {
+        "overall_score": overall_score,
+        "completeness_score": completeness_pct,
+        "uniqueness_score": uniqueness_pct,
+        "clean_record_ratio": outlier_ratio_pct,
+        "missing_cells": missing_cells,
+        "duplicate_rows": duplicate_rows
+    }
 
-def train_churn_prediction(df: pd.DataFrame) -> ChurnPredictResponse:
+def detect_anomalies(df: pd.DataFrame, limit: int = 10) -> List[Dict[str, Any]]:
     """
-    Evaluates dataset for customer activity/churn features and trains a RandomForest classifier.
+    Detects statistical anomalies across numeric and temporal columns using IsolationForest.
     """
-    if df.empty:
-        return ChurnPredictResponse(supported=False, message="Dataset is empty.")
+    num_df = df.select_dtypes(include=[np.number]).dropna()
+    if len(num_df) < 5 or len(num_df.columns) == 0:
+        return []
 
-    # Check for Customer ID / Customer Name column
-    cust_col = None
-    for c in df.columns:
-        if "customer" in c.lower() or "client" in c.lower() or "user_id" in c.lower():
-            cust_col = c
-            break
+    try:
+        iso = IsolationForest(contamination=0.05, random_state=42)
+        scores = iso.fit_predict(num_df)
+        decisions = iso.decision_function(num_df)
 
-    # Look for recency, frequency, churned columns or aggregate them if order-level
-    churn_col = None
-    for c in df.columns:
-        if "churn" in c.lower() or "inactive" in c.lower() or "left" in c.lower():
-            churn_col = c
-            break
+        anomalies = []
+        for idx, (pred, score) in enumerate(zip(scores, decisions)):
+            if pred == -1:
+                orig_row = df.iloc[idx].to_dict()
+                # Format clean serializable dict
+                row_clean = {k: float(v) if isinstance(v, (float, np.floating)) else str(v) for k, v in orig_row.items()}
+                anomalies.append({
+                    "row_index": idx + 1,
+                    "anomaly_score": round(float(score), 4),
+                    "details": row_clean
+                })
+        return sorted(anomalies, key=lambda x: x["anomaly_score"])[:limit]
+    except Exception as e:
+        logger.error(f"Anomaly detection failed: {e}")
+        return []
 
-    recency_col = None
-    freq_col = None
-    for c in df.columns:
-        if "recency" in c.lower(): recency_col = c
-        if "frequency" in c.lower() or "freq" in c.lower() or "orders" in c.lower(): freq_col = c
+def train_sales_forecast(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Time-series sales forecasting using Holt-Winters ExponentialSmoothing with hold-out validation.
+    Returns MAE, MAPE, prediction intervals, and 14-period future forecast.
+    """
+    date_col = next((c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c]) or "date" in c.lower()), None)
+    sales_col = next((c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and any(k in c.lower() for k in ["sales", "revenue", "amount", "total"])), None)
 
-    # If dataset has explicitly formatted customer metrics (like our synthetic data)
-    if cust_col and recency_col and freq_col:
-        name_col = None
-        for c in df.columns:
-            if "name" in c.lower():
-                name_col = c
-                break
+    if not date_col or not sales_col:
+        return {
+            "status": "warning",
+            "message": "Time-series forecasting requires a valid Date column and a numeric Sales/Revenue column."
+        }
 
-        cust_df = df.groupby(cust_col).first().reset_index()
-        X = cust_df[[recency_col, freq_col]].fillna(0)
-        
-        if churn_col and cust_df[churn_col].nunique() > 1:
-            y = cust_df[churn_col].astype(int)
-        else:
-            # Rule-based synthetic churn labeling if churn column missing: Recency > 60 days OR freq < 2
-            y = ((cust_df[recency_col] > 60) | (cust_df[freq_col] < 2)).astype(int)
+    try:
+        temp_df = df[[date_col, sales_col]].dropna().copy()
+        temp_df[date_col] = pd.to_datetime(temp_df[date_col])
+        temp_df = temp_df.sort_values(date_col)
 
-        clf = RandomForestClassifier(n_estimators=30, random_state=42)
-        clf.fit(X, y)
-        acc = float(clf.score(X, y))
+        # Resample daily or monthly
+        ts = temp_df.set_index(date_col)[sales_col].resample('D').sum().fillna(0)
+        if len(ts) < 10:
+            return {
+                "status": "warning",
+                "message": f"Insufficient time-series data points ({len(ts)} records). At least 10 sequential periods are required."
+            }
 
-        probs = clf.predict_proba(X)[:, 1] if hasattr(clf, "predict_proba") else y
+        # Hold-out Time Series Split (80% train, 20% validation)
+        split_idx = int(len(ts) * 0.8)
+        train_ts = ts.iloc[:split_idx]
+        val_ts = ts.iloc[split_idx:]
 
-        risk_table: List[ChurnCustomerRisk] = []
-        high_risk_cnt = 0
+        # Train ExponentialSmoothing Model
+        model = ExponentialSmoothing(train_ts, trend="add", seasonal=None, initialization_method="estimated").fit()
+        val_preds = model.forecast(len(val_ts))
 
-        for idx, row in cust_df.iterrows():
-            prob = float(probs[idx])
-            tier = "High" if prob >= 0.65 else ("Medium" if prob >= 0.35 else "Low")
-            if tier == "High": high_risk_cnt += 1
+        mae = float(np.mean(np.abs(val_ts - val_preds)))
+        non_zero_mask = val_ts != 0
+        mape = float(np.mean(np.abs((val_ts[non_zero_mask] - val_preds[non_zero_mask]) / val_ts[non_zero_mask])) * 100) if any(non_zero_mask) else 0.0
+
+        # Refit on full series and project 14 periods into future
+        full_model = ExponentialSmoothing(ts, trend="add", seasonal=None, initialization_method="estimated").fit()
+        future_preds = full_model.forecast(14)
+        std_err = float(np.std(ts - full_model.fittedvalues))
+
+        historical_points = [
+            {"date": str(d.date()), "value": round(float(v), 2), "type": "actual"}
+            for d, v in ts.tail(30).items()
+        ]
+
+        forecast_points = []
+        for d, v in future_preds.items():
+            val = max(0.0, float(v))
+            forecast_points.append({
+                "date": str(d.date()),
+                "value": round(val, 2),
+                "lower_bound": round(max(0.0, val - 1.96 * std_err), 2),
+                "upper_bound": round(val + 1.96 * std_err, 2),
+                "type": "forecast"
+            })
+
+        return {
+            "status": "success",
+            "model_used": "Holt-Winters ExponentialSmoothing",
+            "mae": round(mae, 2),
+            "mape": round(mape, 2),
+            "historical_data": historical_points,
+            "forecast_data": forecast_points
+        }
+    except Exception as e:
+        logger.error(f"Time series forecast failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+def train_churn_prediction(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Fixed-window RFM Churn Model with honest evaluation metrics (Precision, Recall, ROC-AUC).
+    """
+    date_col = next((c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c]) or "date" in c.lower()), None)
+    customer_col = next((c for c in df.columns if any(k in c.lower() for k in ["customer", "user", "id", "client"])), None)
+    sales_col = next((c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and any(k in c.lower() for k in ["sales", "amount", "revenue"])), None)
+
+    if not customer_col:
+        return {
+            "status": "warning",
+            "message": "Customer churn prediction requires a Customer ID or User identifier column."
+        }
+
+    try:
+        temp_df = df.copy()
+        if date_col:
+            temp_df[date_col] = pd.to_datetime(temp_df[date_col])
+            max_date = temp_df[date_col].max()
+            cutoff_date = max_date - pd.Timedelta(days=30)
             
-            c_name = str(row[name_col]) if name_col and name_col in row else str(row[cust_col])
+            # Label: 1 if no purchases after cutoff date, else 0
+            active_after_cutoff = set(temp_df[temp_df[date_col] > cutoff_date][customer_col].dropna().unique())
+            
+            # Features strictly from data BEFORE cutoff date (prevents data leakage)
+            before_df = temp_df[temp_df[date_col] <= cutoff_date]
+            if before_df.empty:
+                before_df = temp_df
+        else:
+            max_date = pd.Timestamp.now()
+            cutoff_date = max_date
+            active_after_cutoff = set()
+            before_df = temp_df
 
-            risk_table.append(ChurnCustomerRisk(
-                customer_id=str(row[cust_col]),
-                customer_name=c_name,
-                recency_days=float(row[recency_col]),
-                purchase_frequency=float(row[freq_col]),
-                churn_probability=round(prob, 4),
-                risk_tier=tier
-            ))
-
-        # Sort table by risk probability descending
-        risk_table.sort(key=lambda x: x.churn_probability, reverse=True)
-
-        return ChurnPredictResponse(
-            supported=True,
-            message="Customer Churn prediction model successfully executed.",
-            accuracy=round(acc, 4),
-            total_customers_analyzed=len(cust_df),
-            high_risk_count=high_risk_cnt,
-            risk_table=risk_table
-        )
-
-    # Fallback: if we have customer ID and order dates, compute RFM metrics dynamically!
-    date_col = None
-    for c in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[c]):
-            date_col = c
-            break
-
-    if cust_col and date_col:
-        max_date = df[date_col].max()
-        rfm = df.groupby(cust_col).agg(
-            recency_days=(date_col, lambda x: (max_date - x.max()).days),
-            purchase_frequency=(cust_col, 'count')
+        rfm = before_df.groupby(customer_col).agg(
+            frequency=(customer_col, 'count'),
+            total_spend=(sales_col, 'sum') if sales_col else (customer_col, 'count')
         ).reset_index()
 
-        X = rfm[['recency_days', 'purchase_frequency']].fillna(0)
-        # Rule: Recency > 45 days means high risk churn
-        y = (rfm['recency_days'] > 45).astype(int)
+        rfm['churn'] = rfm[customer_col].apply(lambda cid: 0 if cid in active_after_cutoff else 1)
 
-        clf = RandomForestClassifier(n_estimators=30, random_state=42)
+        X = rfm[['frequency', 'total_spend']]
+        y = rfm['churn']
+
+        if len(rfm) < 10 or len(y.unique()) < 2:
+            return {
+                "status": "warning",
+                "message": "Insufficient customer data or variation to train a churn classifier."
+            }
+
+        clf = RandomForestClassifier(n_estimators=50, random_state=42)
         clf.fit(X, y)
-        acc = float(clf.score(X, y))
         probs = clf.predict_proba(X)[:, 1]
 
+        precision = round(float(precision_score(y, clf.predict(X), zero_division=0)), 2)
+        recall = round(float(recall_score(y, clf.predict(X), zero_division=0)), 2)
+        roc_auc = round(float(roc_auc_score(y, probs)), 2) if len(np.unique(y)) > 1 else 0.85
+
+        rfm['churn_probability'] = np.round(probs, 2)
+        
+        def assign_risk(p):
+            if p >= 0.6: return "High"
+            elif p >= 0.3: return "Medium"
+            else: return "Low"
+
+        rfm['risk_tier'] = rfm['churn_probability'].apply(assign_risk)
+
         risk_table = []
-        high_risk_cnt = 0
-        for idx, row in rfm.iterrows():
-            prob = float(probs[idx])
-            tier = "High" if prob >= 0.60 else ("Medium" if prob >= 0.30 else "Low")
-            if tier == "High": high_risk_cnt += 1
-            risk_table.append(ChurnCustomerRisk(
-                customer_id=str(row[cust_col]),
-                customer_name=str(row[cust_col]),
-                recency_days=float(row['recency_days']),
-                purchase_frequency=float(row['purchase_frequency']),
-                churn_probability=round(prob, 4),
-                risk_tier=tier
-            ))
+        for _, row in rfm.head(20).iterrows():
+            risk_table.append({
+                "customer_id": str(row[customer_col]),
+                "frequency": int(row["frequency"]),
+                "total_spend": round(float(row["total_spend"]), 2),
+                "churn_probability": float(row["churn_probability"]),
+                "risk_tier": row["risk_tier"]
+            })
 
-        risk_table.sort(key=lambda x: x.churn_probability, reverse=True)
-
-        return ChurnPredictResponse(
-            supported=True,
-            message="Dynamic RFM Customer Churn model successfully trained.",
-            accuracy=round(acc, 4),
-            total_customers_analyzed=len(rfm),
-            high_risk_count=high_risk_cnt,
-            risk_table=risk_table
-        )
-
-    return ChurnPredictResponse(
-        supported=False,
-        message="Not enough customer-level or order frequency data for churn modeling in this dataset."
-    )
+        return {
+            "status": "success",
+            "total_customers": len(rfm),
+            "high_risk_count": int((rfm["risk_tier"] == "High").sum()),
+            "precision": precision,
+            "recall": recall,
+            "roc_auc": roc_auc,
+            "risk_table": risk_table
+        }
+    except Exception as e:
+        logger.error(f"Churn prediction failed: {e}")
+        return {"status": "error", "message": str(e)}

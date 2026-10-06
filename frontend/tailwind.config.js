@@ -8,15 +8,27 @@ export default {
   theme: {
     extend: {
       colors: {
-        primary: {
-          50: '#eff6ff',
-          100: '#dbeafe',
-          500: '#3b82f6',
-          600: '#2563eb',
-          700: '#1d4ed8',
+        app: 'var(--bg-app)',
+        surface: 'var(--surface-card)',
+        elevated: 'var(--surface-elevated)',
+        border: 'var(--border-color)',
+        accent: {
+          DEFAULT: 'var(--accent)',
+          hover: 'var(--accent-hover)',
+          subtle: 'var(--accent-subtle)',
         },
+      },
+      borderRadius: {
+        DEFAULT: '8px',
+        lg: '8px',
+        md: '6px',
+        sm: '4px',
+      },
+      fontFamily: {
+        sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
       },
     },
   },
   plugins: [],
 }
+
